@@ -322,11 +322,14 @@ impl LayoutConfig {
 
 impl MultiAccountFileConfig {
     pub fn load() -> Result<Option<Self>, String> {
-        let path = config_path();
+        Self::load_from(&config_path())
+    }
+
+    fn load_from(path: &std::path::Path) -> Result<Option<Self>, String> {
         if !path.exists() {
             return Ok(None);
         }
-        let data = fs::read_to_string(&path).map_err(|e| format!("read config: {e}"))?;
+        let data = fs::read_to_string(path).map_err(|e| format!("read config: {e}"))?;
 
         if let Ok(multi) = serde_json::from_str::<MultiAccountFileConfig>(&data) {
             return Ok(Some(multi));
@@ -336,16 +339,22 @@ impl MultiAccountFileConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        if self.accounts.iter().any(|account| account.managed) {
+        self.save_to(&config_path())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.accounts.iter().any(|account| account.managed)
+            || Self::load_from(path)?
+                .is_some_and(|config| config.accounts.iter().any(|account| account.managed))
+        {
             return Err("config contains declaratively managed accounts".into());
         }
-        let path = config_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("create config dir: {e}"))?;
         }
         let data =
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize config: {e}"))?;
-        atomic_write(&path, data.as_bytes())
+        atomic_write(path, data.as_bytes())
     }
 }
 
@@ -360,15 +369,16 @@ impl MultiAccountFileConfig {
 /// 2. Config file (`~/.config/neverlight-mail/config.json`) → multi-account with keyring
 /// 3. Returns `Err(ConfigNeedsInput)` if UI input is needed
 pub fn resolve_all_accounts() -> Result<Vec<AccountConfig>, ConfigNeedsInput> {
-    let result = resolve_all_accounts_detailed();
+    accounts_or_input(resolve_all_accounts_detailed())
+}
+
+fn accounts_or_input(result: AccountResolution) -> Result<Vec<AccountConfig>, ConfigNeedsInput> {
     if !result.accounts.is_empty() {
         return Ok(result.accounts);
     }
     // All accounts failed — pick the most useful error for the UI
     if let Some(f) = result.failures.first() {
-        if f.auth_backend == "oauth"
-            && (f.error.contains("invalid_grant") || f.error.contains("OAuth token refresh failed"))
-        {
+        if f.auth_backend == "oauth" {
             return Err(ConfigNeedsInput::OAuthReauth {
                 account_id: f.account_id.clone(),
                 label: f.label.clone(),
@@ -567,6 +577,52 @@ mod tests {
         assert!(json.contains(r#""backend":"keyring""#));
         let parsed: AuthBackend = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, AuthBackend::Keyring));
+    }
+
+    #[test]
+    fn existing_managed_config_cannot_be_replaced_or_deleted() {
+        let directory = std::env::temp_dir().join(format!("neverlight-config-{}", new_account_id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("config.json");
+        let data = br#"{"accounts":[{"id":"managed","label":"Mail","jmap_url":"https://mail.example/jmap/session","username":"alice","managed":true,"auth":{"backend":"keyring"}}]}"#;
+        fs::write(&path, data).unwrap();
+
+        let mut edited = MultiAccountFileConfig::load_from(&path).unwrap().unwrap();
+        edited.accounts[0].managed = false;
+        assert!(edited.save_to(&path).is_err());
+        assert!(MultiAccountFileConfig {
+            accounts: Vec::new()
+        }
+        .save_to(&path)
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), data);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_oauth_credentials_request_browser_reauthorization() {
+        let result = AccountResolution {
+            accounts: Vec::new(),
+            failures: vec![AccountResolutionError {
+                account_id: "managed".into(),
+                label: "Mail".into(),
+                jmap_url: "https://mail.example/jmap/session".into(),
+                username: "alice".into(),
+                auth_backend: "oauth".into(),
+                oauth_client_id: Some("configured-client".into()),
+                error: "OAuth refresh token is not in the keyring: missing".into(),
+            }],
+        };
+        let Err(ConfigNeedsInput::OAuthReauth {
+            account_id,
+            client_id,
+            ..
+        }) = accounts_or_input(result)
+        else {
+            panic!("missing OAuth credentials must request browser reauthorization");
+        };
+        assert_eq!(account_id, "managed");
+        assert_eq!(client_id, "configured-client");
     }
 
     #[test]

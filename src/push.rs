@@ -280,6 +280,8 @@ mod tests {
         let url = build_event_source_url(template, &config);
         assert!(url.contains("types=Email,Mailbox"));
         assert!(!url.contains("closeafter="));
+        // RFC 8620 §7.3 explicitly permits zero to disable ping events.
+        assert!(url.contains("ping=0"));
     }
 
     #[test]

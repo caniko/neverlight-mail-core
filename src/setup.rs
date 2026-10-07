@@ -428,6 +428,11 @@ impl SetupModel {
                     }
                 };
 
+                if existing.managed {
+                    self.error = Some("Account is managed by external configuration".into());
+                    return SetupTransition::Continue;
+                }
+
                 // If URL/username changed, require token re-entry
                 let creds_changed = existing.jmap_url != jmap_url || existing.username != username;
                 if creds_changed && self.token.is_empty() {
@@ -560,10 +565,13 @@ pub struct SetupFields {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Check whether a connect error indicates an OAuth ratchet/grant failure
+/// Check whether an error indicates missing or invalid OAuth credentials
 /// that requires browser re-authorization.
 pub fn is_oauth_reauth_error(error: &str) -> bool {
-    error.contains("invalid_grant") || error.contains("OAuth token refresh failed")
+    error.contains("invalid_grant")
+        || error.contains("OAuth token refresh failed")
+        || error.contains("OAuth refresh token is not in the keyring")
+        || error.contains("cannot persist refreshed OAuth token for managed account")
 }
 
 /// Store a token in keyring, fall back to plaintext.
@@ -605,4 +613,23 @@ fn parse_email_list(input: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_oauth_reauth_error;
+
+    #[test]
+    fn managed_refresh_token_failures_require_reauthorization() {
+        assert!(is_oauth_reauth_error(
+            "cannot persist refreshed OAuth token for managed account: locked"
+        ));
+        assert!(is_oauth_reauth_error(
+            "OAuth refresh token is not in the keyring: missing"
+        ));
+        assert!(is_oauth_reauth_error(
+            "OAuth token refresh failed: invalid_grant"
+        ));
+        assert!(!is_oauth_reauth_error("JMAP session HTTP 503"));
+    }
 }
